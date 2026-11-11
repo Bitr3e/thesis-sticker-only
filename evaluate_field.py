@@ -1,57 +1,44 @@
 """
-Chapter 5: evaluate YOLO26n and YOLO11n on the labelled field-test images.
+Evaluate the final YOLO26n and YOLO11n checkpoints on the held-out test set.
 
-Matches the thesis (Step 8, SOP 3 and SOP 4):
-  1. Standard metrics on the field images (Ultralytics validation, same as
-     evaluate_test.py): precision, recall, F1, mAP@0.5, mAP@0.5:0.95, and
-     TP / FP / FN at the 0.25 threshold. Reported for all field images and
-     for each distance (6-10 m, beyond the 5 m baseline).
-  2. Per-sticker detection outcomes: a sticker is DETECTED when a predicted
-     box has confidence >= 0.25 and IoU >= 0.5 with its ground-truth box.
-  3. Distance breaking points (SOP 4), from captures of parked vehicles so
-     that distance is the only condition changing: logistic regression of
-     the detection outcome on sticker pixel width at the 640-pixel model
-     input gives
-        x50 = width at which the detection rate falls to 50% (breaking point)
-        x90 = width at which it equals 90% (reliable-detection limit)
-     A second regression on distance in metres gives the same two points in
-     metres, which are easier to read.
-  4. Model comparison on the same stickers:
-        - 95% CI of the x50 difference (YOLO26n - YOLO11n) from 1,000 paired
-          bootstrap resamples of the images
-        - McNemar's exact test on the paired per-sticker outcomes
+This produces the main result table for the thesis (SOP 2 and SOP 3):
+  1. Accuracy on the 210 test images, from Ultralytics' validator:
+       - precision, recall, F1
+       - mAP@0.5 and mAP@0.5:0.95 (COCO-style, 101-point interpolation)
+       - TP / FP / FN counts at the app's confidence threshold (0.25)
+  2. Speed on the same 210 test images, one image at a time (batch 1):
+       - one full untimed warm-up pass per model first
+       - three timed runs per model, swapping the model order each run
+       - FPS as mean and SD of the three runs, end to end and model only
+  The script checks that it runs on the GTX 1660 SUPER desktop.
+       - preprocess / inference / postprocess time per image
+       - mean, standard deviation, median and 95th percentile
+       - FPS, on the GPU and on the CPU
 
-What you need first:
-  - research_outputs/field_test/field_log.csv (from the app's Field Test tab)
-  - the field images uploaded to the Ultralytics Platform as their own dataset
-    and labelled (a box around every sticker). Do NOT rename the files.
+Both models are evaluated the same way. YOLO26n uses its NMS-free one-to-one
+head (nms=False), exactly as in app.py. YOLO11n uses standard NMS.
 
-Run on the RTX 2050 field laptop (the script checks):
-    python evaluate_field.py
-    python evaluate_field.py --data ul://carl-andre-de-castro/datasets/<name>
+Usage (from the project folder, with the venv active):
+    python evaluate_test.py                  # accuracy + GPU and CPU speed
+    python evaluate_test.py --skip-speed     # accuracy only
+    python evaluate_test.py --devices gpu    # speed on the GPU only
 
-Outputs (research_outputs/field_results/):
-    field_metrics.csv          standard metrics per group and model
-    field_outcomes.csv         one row per labelled sticker, both models
-    field_breaking_points.csv  x50 / x90 (pixel width and metres) per model
-    field_comparison.csv       bootstrap CI of the x50 difference, McNemar
-    field_data_check.csv       images / log rows that could not be matched
-    field_matches.csv          which labelled image each log row was linked to
-    chart_distance.png         detection rate per distance + fitted curves
-    field_evaluation.jsonl     everything, with versions and settings
+Outputs:
+    research_outputs/test_metrics.csv       accuracy table (one row per model)
+    research_outputs/test_speed.csv         speed table (one row per model and device)
+    research_outputs/test_evaluation.jsonl  everything, with versions and settings
+    runs/test_eval/<model>/                  PR curve, F1 curve, confusion matrix
 """
 
 import argparse
 import csv
-import math
-import random
-import tempfile
+import hashlib
+import json
+import platform
+import statistics
+import time
 from datetime import datetime
 from pathlib import Path
-
-import yaml
-
-import evaluate_test as ev
 
 
 # ============================================================
@@ -60,869 +47,668 @@ import evaluate_test as ev
 
 BASE_DIR = Path(__file__).resolve().parent
 
-# Ultralytics Platform address of the LABELLED field dataset, or a data.yaml.
-FIELD_DATA = "ul://carl-andre-de-castro/datasets/student-vehicle-sticker-field"
+# The dataset on the Ultralytics Platform (the address train.py uses).
+PLATFORM_DATA = "ul://carl-andre-de-castro/datasets/student-vehicle-sticker"
 
-FIELD_LOG = BASE_DIR / "research_outputs" / "field_test" / "field_log.csv"
-RESULTS_DIR = BASE_DIR / "research_outputs" / "field_results"
-RUNS_DIR = BASE_DIR / "runs" / "field_eval"
+# The exact copy of the dataset that the final models were trained and tested
+# on (downloaded by Ultralytics on this computer before some photos were
+# re-uploaded to the Platform in Nov 2026). The tests use this copy, so every
+# result refers to the same 210 test photos. If it is not on this computer
+# (e.g. the classmate's laptop), the Platform address is used instead.
+ORIGINAL_DATASET = Path.home() / "datasets" / "student-vehicle-sticker-b0394f94"
+ORIGINAL_YAML = BASE_DIR / "original_dataset.yaml"
 
-# Groups reported with standard metrics: distance is the only field-test
-# condition. Daylight only: dusk and night were excluded (headlights hid
-# the sticker).
-GROUPS = {
-    "distance_m": ["6", "7", "8", "9", "10"],   # beyond the 5 m baseline
+
+def default_data():
+    """Local data.yaml of the original dataset copy, else the Platform."""
+    images = ORIGINAL_DATASET / "images"
+    if not (images / "test").is_dir():
+        return PLATFORM_DATA
+    for found in sorted(ORIGINAL_DATASET.glob("*.yaml")):
+        return str(found)
+    # No yaml in the copy: write one. Ultralytics requires train and val
+    # entries; the tests only read the test split.
+    test = "images/test"
+    train = "images/train" if (images / "train").is_dir() else test
+    val = "images/val" if (images / "val").is_dir() else test
+    ORIGINAL_YAML.write_text(
+        f"path: {ORIGINAL_DATASET.as_posix()}\ntrain: {train}\nval: {val}\n"
+        f"test: {test}\nnames:\n  0: student-vehicle-sticker\n",
+        encoding="utf-8")
+    return str(ORIGINAL_YAML)
+
+
+DATA = default_data()
+
+FINAL_RUNS_DIR = BASE_DIR / "runs" / "detect" / "carl-andre-de-castro" / "runs"
+
+MODEL_PATHS = {
+    "YOLO26n": FINAL_RUNS_DIR / "yolo26n_final_70_15_15" / "weights" / "best.pt",
+    "YOLO11n": FINAL_RUNS_DIR / "yolo11n_final_70_15_15-2" / "weights" / "best.pt",
 }
-# (Lighting, motion and occlusion are the same for every field capture:
-# daylight, parked, nothing covering the sticker. They are tested in
-# Test 3 instead.)
 
-DISTANCE_MOTION = "parked"   # distance breaking points use parked captures
-DETECT_CONF = 0.25           # thesis definition of "detected"
-DETECT_IOU = 0.50
-BOOTSTRAP_RESAMPLES = 1000   # thesis SOP 4
-BOOTSTRAP_SEED = 0
-MIN_GROUP_IMAGES = 10        # smaller groups are flagged as unreliable
+# Inference head for each model, identical to app.py.
+HEADS = {
+    "YOLO26n": {"label": "one-to-one (NMS-free)", "args": {"nms": False}},
+    "YOLO11n": {"label": "NMS", "args": {}},
+}
 
-IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+EXPECTED_TEST_IMAGES = 210
+STICKER_KEYWORD = "sticker"
+
+IMAGE_SIZE = 640
+BATCH = 16                 # for the accuracy run only; speed uses batch 1
+MAP_CONF = 0.001           # Ultralytics' standard confidence floor for mAP
+APP_CONF = 0.25            # the app's default threshold, for TP / FP / FN
+NMS_IOU = 0.7              # Ultralytics default NMS IoU (YOLO11n only)
+
+OUTPUT_DIR = BASE_DIR / "research_outputs"
+EVAL_RUNS_DIR = BASE_DIR / "runs" / "test_eval"
+
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 
 
 # ============================================================
-# DATA
+# SMALL HELPERS
 # ============================================================
 
-def read_field_log(path):
-    if not Path(path).is_file():
-        raise SystemExit(f"Field log not found: {path}\n"
-                         "Capture images with the app's Field Test tab first.")
-
-    with Path(path).open(newline="", encoding="utf-8-sig") as file:
-        rows = [row for row in csv.DictReader(file) if row.get("capture_id")]
-
-    if not rows:
-        raise SystemExit(f"The field log is empty: {path}")
-    return rows
+def timestamp_now():
+    return datetime.now().isoformat(timespec="seconds")
 
 
-def convert_field_dataset(data):
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as file:
+        for block in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def f1_score(precision, recall):
+    total = precision + recall
+    return 2 * precision * recall / total if total > 0 else 0.0
+
+
+def safe_div(a, b):
+    return a / b if b else 0.0
+
+
+def percentile(values, q):
+    """Linear-interpolation percentile (same method as numpy's default)."""
+    ordered = sorted(values)
+    if not ordered:
+        return float("nan")
+    position = (len(ordered) - 1) * q / 100
+    low = int(position)
+    high = min(low + 1, len(ordered) - 1)
+    return ordered[low] + (ordered[high] - ordered[low]) * (position - low)
+
+
+def summarize(values):
+    """Mean, SD, median and 95th percentile of a list of milliseconds."""
+    return {
+        "mean": statistics.fmean(values),
+        "sd": statistics.stdev(values) if len(values) > 1 else 0.0,
+        "median": statistics.median(values),
+        "p95": percentile(values, 95),
+    }
+
+
+def sticker_class_ids(names):
+    """Class ids whose name contains the sticker keyword."""
+    if isinstance(names, (list, tuple)):
+        names = dict(enumerate(names))
+    return [int(i) for i, n in names.items() if STICKER_KEYWORD in str(n).lower()]
+
+
+def round_dict(record, digits=5):
+    return {
+        key: round(value, digits) if isinstance(value, float) else value
+        for key, value in record.items()
+    }
+
+
+def write_csv(path, rows):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    columns = []
+    for row in rows:
+        columns += [key for key in row if key not in columns]
+
+    with path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def append_jsonl(path, record):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as file:
+        file.write(json.dumps(record, default=str) + "\n")
+
+
+def environment_info():
+    import torch
+    import ultralytics
+
+    gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
+    return {
+        "python": platform.python_version(),
+        "os": platform.platform(),
+        "cpu": platform.processor() or platform.machine(),
+        "torch": torch.__version__,
+        "cuda": torch.version.cuda,
+        "ultralytics": ultralytics.__version__,
+        "gpu": gpu,
+        "cpu_threads": torch.get_num_threads(),
+    }
+
+
+# Thesis Limitation section: the natural test set, the synthetic stressor
+# test and the FPS benchmark run on the GTX 1660 SUPER desktop; only the
+# field test runs on the RTX 2050 laptop. Each script stops if it finds a
+# different GPU, so results from the wrong machine cannot end up in the
+# tables by mistake.
+EXPECTED_TEST_GPU = "GTX 1660 SUPER"
+EXPECTED_FIELD_GPU = "RTX 2050"
+
+
+def check_test_gpu(allow_other, expected=EXPECTED_TEST_GPU):
+    """Stop unless the GPU is the one the thesis names (or the user overrides)."""
+    import torch
+
+    found = (torch.cuda.get_device_name(0) if torch.cuda.is_available()
+             else "no CUDA GPU")
+
+    if expected.lower() in found.lower():
+        return found
+
+    message = (f"This computer's GPU is '{found}', but the thesis says this "
+               f"test runs on the {expected}.")
+    if not allow_other:
+        raise SystemExit(
+            message + f"\nRun this script on the {expected} computer, or add "
+            "--allow-other-gpu if you really mean to use this computer "
+            "(then update the thesis text to match).")
+    print("WARNING: " + message + " Continuing because of --allow-other-gpu.")
+    return found
+
+
+# ============================================================
+# DATASET
+# ============================================================
+
+def resolve_test_images(data):
     """
-    Convert the Platform dataset to YOLO folders. Ultralytics refuses a
-    dataset with no 'train' split, but the field dataset is test-only (it is
-    never used for training). In that case the dataset's file list is
-    downloaded, a local copy with every photo marked 'train' is converted
-    instead, and all splits are read anyway, so every photo is still used.
-    The dataset on the Platform is not changed.
+    Return (data_yaml_path, list_of_test_image_paths, class_names).
+    Platform datasets are converted to YOLO format by Ultralytics itself,
+    the same conversion its validator uses.
     """
-    import json
+    from ultralytics.data.utils import (check_det_dataset,
+                                        convert_ndjson_to_yolo_if_needed)
 
-    from ultralytics.data.utils import convert_ndjson_to_yolo_if_needed
-
-    try:
-        return convert_ndjson_to_yolo_if_needed(str(data), 1.0, split="test")
-    except ValueError as error:
-        if "'train' split" not in str(error):
-            raise
-
-    from ultralytics.utils.checks import check_file
-
-    folder = BASE_DIR / "research_outputs" / "field_dataset_list"
-    folder.mkdir(parents=True, exist_ok=True)
-    listing = Path(check_file(str(data), download_dir=str(folder)))
-    lines = [json.loads(line) for line in
-             listing.read_text(encoding="utf-8").splitlines() if line.strip()]
-    lines[0].pop("path", None)        # keep the Platform's own image links
-    for record in lines[1:]:
-        record["split"] = "train"
-    patched = folder / f"{listing.stem}-all.ndjson"
-    patched.write_text("\n".join(json.dumps(line) for line in lines) + "\n",
-                       encoding="utf-8")
-    print(f"Test-only dataset: converted {len(lines) - 1} photos from a "
-          "local copy of its file list")
-    return convert_ndjson_to_yolo_if_needed(str(patched), 1.0)
-
-
-def dataset_images(data):
-    """(class_names, {image_stem: image_path}) over every dataset split."""
-    from ultralytics.data.utils import check_det_dataset
-
-    data_yaml = convert_field_dataset(data)
+    data_yaml = convert_ndjson_to_yolo_if_needed(str(data), 1.0, split="test")
     config = check_det_dataset(str(data_yaml))
-    root = Path(config.get("path", "."))
 
-    images = {}
-    for split in ("train", "val", "test"):
-        if config.get(split):
-            for path in ev.collect_images(config[split], root):
-                if path.suffix.lower() in IMAGE_SUFFIXES:
-                    images[path.stem] = path
+    if not config.get("test"):
+        raise SystemExit(
+            "The dataset has no 'test' split. The thesis needs the 210 "
+            "held-out test images."
+        )
 
-    return config.get("names", {}), images
-
-
-def label_path(image_path):
-    """Ultralytics' rule: replace the last 'images' folder with 'labels'."""
-    parts = list(Path(image_path).parts)
-    index = len(parts) - 1 - parts[::-1].index("images")
-    parts[index] = "labels"
-    return Path(*parts).with_suffix(".txt")
+    images = collect_images(config["test"], Path(config.get("path", ".")))
+    return data_yaml, images, config.get("names", {})
 
 
-def read_labels(image_path):
-    """YOLO label lines -> list of (cx, cy, w, h), all normalised 0-1."""
-    path = label_path(image_path)
-    if not path.is_file():
-        return []
+def collect_images(entry, root):
+    if isinstance(entry, (list, tuple)):
+        found = []
+        for item in entry:
+            found += collect_images(item, root)
+        return sorted(set(found))
 
-    boxes = []
-    for line in path.read_text().splitlines():
-        parts = line.split()
-        if len(parts) >= 5:
-            boxes.append(tuple(float(v) for v in parts[1:5]))
-    return boxes
+    path = Path(entry)
+    path = path if path.is_absolute() else root / path
 
+    if path.is_file() and path.suffix == ".txt":
+        lines = path.read_text(encoding="utf-8").splitlines()
+        return sorted(
+            (Path(line.strip()) if Path(line.strip()).is_absolute()
+             else root / line.strip())
+            for line in lines if line.strip()
+        )
 
-def image_size(image_path):
-    from PIL import Image
+    if path.is_dir():
+        return sorted(
+            p for p in path.rglob("*") if p.suffix.lower() in IMAGE_SUFFIXES
+        )
 
-    with Image.open(image_path) as image:
-        return image.size        # (width, height)
-
-
-SIMILARITY_MAX = 10.0    # mean grey-level difference (0-255) for a picture match
-FINGERPRINT_SIZE = 32
-
-
-def logged_photo(row, log_dir):
-    """The photo file on this computer that a log row refers to."""
-    relative = str(row.get("image_file", "")).replace("\\", "/")
-    return Path(log_dir) / relative
-
-
-def log_stem(row):
-    return Path(str(row.get("image_file", "")).replace("\\", "/")).stem
-
-
-def content_keys(path):
-    """Hashes the Ultralytics Platform may put in a downloaded file's name."""
-    import hashlib
-
-    data = Path(path).read_bytes()
-    return {hashlib.md5(data).hexdigest(), hashlib.sha256(data).hexdigest(),
-            hashlib.sha256(data).hexdigest()[:32],
-            hashlib.sha1(data).hexdigest()[:32]}
-
-
-def name_hash(image_path):
-    """'022280be...13863_51' -> '022280be...13863' (the Platform's name)."""
-    stem = Path(image_path).stem.lower()
-    head, _, tail = stem.rpartition("_")
-    return head if head and tail.isdigit() else stem
-
-
-def fingerprint(path):
-    """A tiny grey version of the picture, to recognise the same photo even
-    after the Platform re-saved it."""
-    import numpy as np
-    from PIL import Image
-
-    with Image.open(path) as image:
-        small = image.convert("L").resize((FINGERPRINT_SIZE,
-                                           FINGERPRINT_SIZE))
-    return np.asarray(small, dtype=float)
-
-
-def match_images(rows, images, log_dir=None):
-    """
-    Link each log row to its labelled image, in this order:
-      1. same file name
-      2. identical file (the Platform renames downloads to a content hash)
-      3. same picture (tiny grey fingerprint, one-to-one, closest first)
-    Returns (matched, problems); every link is also listed in
-    field_matches.csv so it can be checked.
-    """
-    log_dir = Path(log_dir) if log_dir else FIELD_LOG.parent
-    by_hash = {name_hash(p): p for p in images.values()}
-    links, pending, used = {}, [], set()
-
-    for index, row in enumerate(rows):
-        image = images.get(log_stem(row))
-        how = "file name"
-        local = logged_photo(row, log_dir)
-        if image is None and local.is_file():
-            image = next((by_hash[k] for k in content_keys(local)
-                          if k in by_hash and by_hash[k] not in used), None)
-            how = "identical file"
-        if image is not None and image not in used:
-            links[index] = (image, how, "")
-            used.add(image)
-        elif local.is_file():
-            pending.append(index)
-
-    free = [p for p in images.values() if p not in used]
-    if pending and free:
-        prints = {p: fingerprint(p) for p in free}
-        pairs = []
-        for index in pending:
-            mine = fingerprint(logged_photo(rows[index], log_dir))
-            for path, other in prints.items():
-                pairs.append((float(abs(mine - other).mean()), index, path))
-        for difference, index, path in sorted(pairs, key=lambda x: x[0]):
-            if (difference <= SIMILARITY_MAX and index not in links
-                    and path not in used):
-                links[index] = (path, "same picture",
-                                round(difference, 2))
-                used.add(path)
-
-    matched, problems, report = [], [], []
-    for index, row in enumerate(rows):
-        if index not in links:
-            problems.append({"problem": "in log, not in labelled dataset",
-                             "file": row["image_file"]})
-            continue
-        image, how, difference = links[index]
-        report.append({"log_file": row["image_file"],
-                       "distance_m": row.get("distance_m", ""),
-                       "dataset_file": image.name, "matched_by": how,
-                       "picture_difference": difference})
-        labels = read_labels(image)
-        if row.get("sticker_present") == "yes" and not labels:
-            problems.append({
-                "problem": "marked 'sticker present' but has no label box "
-                           "(not labelled yet, or sticker not visible)",
-                "file": row["image_file"]})
-        if row.get("sticker_present") == "no" and labels:
-            problems.append({"problem": "marked 'no sticker' but has a "
-                                        "label box", "file": row["image_file"]})
-        matched.append((row, image, len(labels)))
-
-    for image in images.values():
-        if image not in used:
-            problems.append({"problem": "in labelled dataset, not in log "
-                                        "(excluded)", "file": image.name})
-
-    match_images.report = report
-    return matched, problems
-
-
-def build_groups(matched):
-    """Yield (factor, level, items): all images first, then each level."""
-    yield "all", "all", matched
-
-    for factor, levels in GROUPS.items():
-        seen = {row.get(factor, "") for row, _, _ in matched}
-        ordered = [lvl for lvl in levels if lvl in seen]
-        ordered += sorted(seen - set(levels))
-
-        for level in ordered:
-            yield factor, level, [m for m in matched
-                                  if m[0].get(factor, "") == level]
-
-
-def write_group_yaml(folder, name, image_paths, names):
-    folder.mkdir(parents=True, exist_ok=True)
-    listing = folder / f"{name}.txt"
-    listing.write_text("\n".join(str(p.resolve()) for p in image_paths) + "\n",
-                       encoding="utf-8")
-
-    config = {"path": str(folder.resolve()), "train": str(listing.resolve()),
-              "val": str(listing.resolve()), "test": str(listing.resolve()),
-              "names": names}
-    data_yaml = folder / f"{name}.yaml"
-    data_yaml.write_text(yaml.safe_dump(config, sort_keys=False),
-                         encoding="utf-8")
-    return data_yaml
+    return []
 
 
 # ============================================================
-# STANDARD METRICS (same Ultralytics evaluation as Chapter 4)
+# ACCURACY
 # ============================================================
 
-def evaluate_group(checkpoint, head, data_yaml, device, run_name,
-                   labelled_boxes):
+def sticker_metrics(box, class_id):
+    """
+    Precision, recall, mAP@0.5 and mAP@0.5:0.95 for the sticker class.
+    With a single-class dataset this equals the overall result.
+    """
+    ap_classes = [int(c) for c in list(box.ap_class_index)]
+
+    if class_id not in ap_classes:
+        return {"precision": 0.0, "recall": 0.0, "map50": 0.0, "map50_95": 0.0}
+
+    p, r, ap50, ap = box.class_result(ap_classes.index(class_id))
+    return {"precision": float(p), "recall": float(r),
+            "map50": float(ap50), "map50_95": float(ap)}
+
+
+def confusion_counts(matrix, class_id):
+    """TP, FP, FN for one class from Ultralytics' (nc+1) x (nc+1) matrix."""
+    tp = float(matrix[class_id][class_id])
+    fp = float(sum(matrix[class_id])) - tp
+    fn = float(sum(row[class_id] for row in matrix)) - tp
+    return int(round(tp)), int(round(fp)), int(round(fn))
+
+
+def match_and_confidence(checkpoint, head, test_images, device):
+    import cv2
+    import evaluate_field as ef
     from ultralytics import YOLO
 
-    common = {
-        "data": str(data_yaml), "split": "test", "imgsz": ev.IMAGE_SIZE,
-        "batch": ev.BATCH, "iou": ev.NMS_IOU, "device": device,
-        "project": str(RUNS_DIR), "exist_ok": True, "verbose": False,
-        **head["args"],
-    }
-
     model = YOLO(str(checkpoint))
-    class_id = ev.sticker_class_ids(model.names)[0]
+    found_conf, missed, false_alarms, stickers = [], 0, 0, 0
 
-    metrics = model.val(conf=ev.MAP_CONF, plots=True, name=run_name, **common)
-    scores = ev.sticker_metrics(metrics.box, class_id)
-
-    model = YOLO(str(checkpoint))
-    at_app = model.val(conf=ev.APP_CONF, plots=True,
-                       name=f"{run_name}_conf{ev.APP_CONF}", **common)
-    tp, fp, fn = ev.confusion_counts(
-        at_app.confusion_matrix.matrix.tolist(), class_id)
-
-    has = labelled_boxes > 0
-    p_app = ev.safe_div(tp, tp + fp) if tp + fp else None
-    r_app = ev.safe_div(tp, tp + fn) if has else None
-
-    return {
-        "precision": scores["precision"] if has else None,
-        "recall": scores["recall"] if has else None,
-        "f1": ev.f1_score(scores["precision"], scores["recall"]) if has
-        else None,
-        "map50": scores["map50"] if has else None,
-        "map50_95": scores["map50_95"] if has else None,
-        "tp_at_app_conf": tp, "fp_at_app_conf": fp, "fn_at_app_conf": fn,
-        "precision_at_app_conf": p_app,
-        "recall_at_app_conf": r_app,
-        "f1_at_app_conf": (ev.f1_score(p_app, r_app)
-                           if p_app is not None and r_app is not None
-                           else None),
-        "plots_folder": str(Path(metrics.save_dir)),
-    }
-
-
-# ============================================================
-# PER-STICKER OUTCOMES
-# ============================================================
-
-def iou(a, b):
-    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
-    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
-    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
-    union = ((a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1])
-             - inter)
-    return inter / union if union > 0 else 0.0
-
-
-def match_stickers(truth, predictions):
-    """
-    Greedy one-to-one matching, highest confidence first.
-    truth: list of xyxy. predictions: list of (xyxy, conf), conf >= 0.25.
-    Returns, per truth box, (detected, confidence, iou).
-    """
-    results = [(0, None, 0.0)] * len(truth)
-    taken = set()
-
-    for box, conf in sorted(predictions, key=lambda p: -p[1]):
-        best, best_iou = None, DETECT_IOU
-        for index, gt in enumerate(truth):
-            if index in taken:
-                continue
-            value = iou(box, gt)
-            if value >= best_iou:
-                best, best_iou = index, value
-        if best is not None:
-            taken.add(best)
-            results[best] = (1, conf, best_iou)
-
-    return results
-
-
-def sticker_outcomes(models, matched, device):
-    """One row per labelled sticker with both models' outcomes."""
-    rows = []
-
-    for row, image, _ in matched:
-        labels = read_labels(image)
-        if not labels:
-            continue
-
-        width, height = image_size(image)
-        scale = ev.IMAGE_SIZE / max(width, height)
+    for path in test_images:
+        labels = ef.read_labels(path)
+        image = cv2.imread(str(path))
+        if image is None:
+            raise SystemExit(f"Could not read test image: {path}")
+        height, width = image.shape[:2]
         truth = [((cx - w / 2) * width, (cy - h / 2) * height,
                   (cx + w / 2) * width, (cy + h / 2) * height)
                  for cx, cy, w, h in labels]
 
-        outcome = {}
-        for name, (model, head) in models.items():
-            result = model.predict(
-                source=str(image), conf=DETECT_CONF, iou=ev.NMS_IOU,
-                imgsz=ev.IMAGE_SIZE, device=device, verbose=False,
-                **head["args"])[0]
-            boxes = result.boxes
-            predictions = []
-            if boxes is not None and len(boxes):
-                xyxy = boxes.xyxy.cpu().numpy().tolist()
-                confs = boxes.conf.cpu().numpy().tolist()
-                predictions = list(zip(xyxy, confs))
-            outcome[name] = match_stickers(truth, predictions)
+        result = model.predict(source=image, conf=APP_CONF, iou=NMS_IOU,
+                               imgsz=IMAGE_SIZE, device=device, verbose=False,
+                               **head["args"])[0]
+        boxes = result.boxes
+        predictions = (list(zip(boxes.xyxy.cpu().numpy().tolist(),
+                                boxes.conf.cpu().numpy().tolist()))
+                       if boxes is not None and len(boxes) else [])
 
-        for index, (cx, cy, w, h) in enumerate(labels):
-            item = {
-                "image": image.name,
-                "capture_id": row.get("capture_id", ""),
-                "sticker_index": index,
-                **{factor: row.get(factor, "") for factor in GROUPS},
-                "motion": row.get("motion", "") or DISTANCE_MOTION,
-                "sticker_px_width_640": w * width * scale,
-                "sticker_px_height_640": h * height * scale,
-            }
-            for name in models:
-                detected, conf, overlap = outcome[name][index]
-                item[f"{name}_detected"] = detected
-                item[f"{name}_confidence"] = conf
-                item[f"{name}_iou"] = overlap
-            rows.append(item)
+        outcomes = ef.match_stickers(truth, predictions)
+        hits = [o[1] for o in outcomes if o[0]]
+        found_conf += hits
+        missed += len(truth) - len(hits)
+        false_alarms += len(predictions) - len(hits)
+        stickers += len(truth)
 
+    tp = len(found_conf)
+    return {
+        "tp": tp, "fp": false_alarms, "fn": missed, "stickers": stickers,
+        "mean_conf_detected": statistics.fmean(found_conf) if found_conf else 0.0,
+        "sd_conf_detected": statistics.stdev(found_conf) if tp > 1 else 0.0,
+        "median_conf_detected": statistics.median(found_conf) if found_conf else 0.0,
+        "mean_conf_all_stickers": safe_div(sum(found_conf), stickers),
+    }
+
+
+def evaluate_accuracy(name, checkpoint, head, data_yaml, device, test_images):
+    from ultralytics import YOLO
+
+    common = {
+        "data": str(data_yaml),
+        "split": "test",
+        "imgsz": IMAGE_SIZE,
+        "batch": BATCH,
+        "iou": NMS_IOU,
+        "device": device,
+        "project": str(EVAL_RUNS_DIR),
+        "exist_ok": True,
+        "verbose": False,
+        **head["args"],
+    }
+    folder = name.replace(" ", "_").replace("(", "").replace(")", "")
+
+    # Run 1: standard mAP evaluation (confidence floor 0.001) with plots.
+    model = YOLO(str(checkpoint))
+    class_ids = sticker_class_ids(model.names)
+
+    if not class_ids:
+        raise SystemExit(f"{name}: no class name contains '{STICKER_KEYWORD}'. "
+                         f"Classes: {model.names}")
+
+    class_id = class_ids[0]
+    metrics = model.val(conf=MAP_CONF, plots=True, name=folder, **common)
+    scores = sticker_metrics(metrics.box, class_id)
+
+    # Run 2: the app's threshold (0.25), for TP / FP / FN counts.
+    # plots=True is required: Ultralytics only fills the confusion matrix
+    # when plotting is on. Its plots go to a separate "_conf0.25" folder.
+    model = YOLO(str(checkpoint))
+    at_app = model.val(conf=APP_CONF, plots=True,
+                       name=f"{folder}_conf{APP_CONF}", **common)
+    ul_tp, ul_fp, ul_fn = confusion_counts(
+        at_app.confusion_matrix.matrix.tolist(), class_id)
+    instances = int(getattr(at_app, "nt_per_class", [0])[class_id]) \
+        if getattr(at_app, "nt_per_class", None) is not None else None
+
+    # Run 3: TP / FP / FN and confidence with the thesis rule
+    # (confidence >= 0.25, IoU >= 0.5), same matching as Tests 2 and 3.
+    own = match_and_confidence(checkpoint, head, test_images, device)
+    tp, fp, fn = own["tp"], own["fp"], own["fn"]
+
+    if tp + fn == 0:
+        raise SystemExit(
+            f"{name}: no labelled stickers were found in the test images "
+            "(TP = FN = 0), so the counts at confidence 0.25 cannot be "
+            "trusted. Please report this output."
+        )
+
+    return round_dict({
+        "model": name,
+        "inference_head": head["label"],
+        "class_name": model.names[class_id],
+        "num_classes_in_model": len(model.names),
+        "precision": scores["precision"],
+        "recall": scores["recall"],
+        "f1": f1_score(scores["precision"], scores["recall"]),
+        "map50": scores["map50"],
+        "map50_95": scores["map50_95"],
+        "app_conf": APP_CONF,
+        "labelled_stickers": instances if instances else tp + fn,
+        "tp_at_app_conf": tp,
+        "fp_at_app_conf": fp,
+        "fn_at_app_conf": fn,
+        "precision_at_app_conf": safe_div(tp, tp + fp),
+        "recall_at_app_conf": safe_div(tp, tp + fn),
+        "f1_at_app_conf": f1_score(safe_div(tp, tp + fp), safe_div(tp, tp + fn)),
+        "mean_conf_detected": own["mean_conf_detected"],
+        "sd_conf_detected": own["sd_conf_detected"],
+        "median_conf_detected": own["median_conf_detected"],
+        "mean_conf_all_stickers": own["mean_conf_all_stickers"],
+        "tp_ultralytics_iou045": ul_tp,
+        "fp_ultralytics_iou045": ul_fp,
+        "fn_ultralytics_iou045": ul_fn,
+        "val_ms_per_image": sum(
+            metrics.speed.get(k, 0.0) for k in ("preprocess", "inference",
+                                                "postprocess")
+        ),
+        "plots_folder": str(Path(metrics.save_dir)),
+    })
+
+
+# ============================================================
+# SPEED
+# ============================================================
+
+def load_images(paths):
+    import cv2
+
+    images = []
+    for path in paths:
+        image = cv2.imread(str(path))
+        if image is None:
+            raise SystemExit(f"Could not read test image: {path}")
+        images.append(image)
+    return images
+
+
+SPEED_ROUNDS = 3           # thesis SOP 5: three timed runs per model and device;
+                           # the model order is swapped every run
+
+
+def benchmark_device(jobs, images, device, device_label):
+    """
+    Time one-image-at-a-time inference for every model on one device.
+
+    Fairness rules (the first model timed must not pay start-up costs):
+      1. Every model first does a full untimed warm-up pass over all test
+         images, so GPU kernels are compiled for every image shape.
+      2. Then SPEED_ROUNDS timed passes, swapping the model order each
+         round (A, B, then B, A), so neither model always runs first.
+    Returns one summary row per model.
+    """
+    from ultralytics import YOLO
+
+    models = {name: (YOLO(str(checkpoint)), head)
+              for name, checkpoint, head in jobs}
+
+    def run(name, image):
+        model, head = models[name]
+        return model.predict(
+            source=image, conf=APP_CONF, iou=NMS_IOU, imgsz=IMAGE_SIZE,
+            device=device, verbose=False, **head["args"],
+        )[0]
+
+    for name in models:                       # untimed warm-up
+        print(f"  warm-up: {name} ({len(images)} images)")
+        for image in images:
+            run(name, image)
+
+    samples = {name: {"pre": [], "inf": [], "post": [], "total": [],
+                      "wall": [], "round_means": [],
+                      "round_model_means": []} for name in models}
+    order = list(models)
+
+    for round_no in range(SPEED_ROUNDS):
+        for name in order:
+            print(f"  timed round {round_no + 1}/{SPEED_ROUNDS}: {name}")
+            data = samples[name]
+            round_totals, round_models = [], []
+
+            for image in images:
+                start = time.perf_counter()
+                result = run(name, image)
+                data["wall"].append((time.perf_counter() - start) * 1000)
+
+                speed = result.speed
+                pre = speed.get("preprocess", 0.0)
+                inf = speed.get("inference", 0.0)
+                post = speed.get("postprocess", 0.0)
+                data["pre"].append(pre)
+                data["inf"].append(inf)
+                data["post"].append(post)
+                data["total"].append(pre + inf + post)
+                round_totals.append(pre + inf + post)
+                round_models.append(inf)
+
+            data["round_means"].append(statistics.fmean(round_totals))
+            data["round_model_means"].append(statistics.fmean(round_models))
+        order.reverse()
+
+    rows = []
+    for name, (_model, head) in models.items():
+        data = samples[name]
+        total_stats = summarize(data["total"])
+        wall_stats = summarize(data["wall"])
+
+        row = {
+            "model": name,
+            "inference_head": head["label"],
+            "device": device_label,
+            "images_per_round": len(images),
+            "timed_rounds": SPEED_ROUNDS,
+            "timed_samples": len(data["total"]),
+            "warmup": f"1 full untimed pass ({len(images)} images)",
+            "batch": 1,
+            "imgsz": IMAGE_SIZE,
+        }
+        for label, key in (("preprocess", "pre"), ("inference", "inf"),
+                           ("postprocess", "post")):
+            stats = summarize(data[key])
+            row[f"{label}_ms_mean"] = stats["mean"]
+            row[f"{label}_ms_sd"] = stats["sd"]
+
+        row.update({
+            "total_ms_mean": total_stats["mean"],
+            "total_ms_sd": total_stats["sd"],
+            "total_ms_median": total_stats["median"],
+            "total_ms_p95": total_stats["p95"],
+            "fps": safe_div(1000, total_stats["mean"]),
+            "wall_ms_mean": wall_stats["mean"],
+            "wall_fps": safe_div(1000, wall_stats["mean"]),
+            "round_total_ms_means": " / ".join(
+                f"{m:.3f}" for m in data["round_means"]),
+        })
+
+        # Thesis SOP 5: FPS as the mean and SD of the runs (one FPS value
+        # per run), end to end and model only.
+        run_fps = [safe_div(1000, m) for m in data["round_means"]]
+        run_model_fps = [safe_div(1000, m)
+                         for m in data["round_model_means"]]
+        row.update({
+            "fps_runs_mean": statistics.fmean(run_fps),
+            "fps_runs_sd": (statistics.stdev(run_fps)
+                            if len(run_fps) > 1 else 0.0),
+            "model_only_fps_runs_mean": statistics.fmean(run_model_fps),
+            "model_only_fps_runs_sd": (statistics.stdev(run_model_fps)
+                                       if len(run_model_fps) > 1 else 0.0),
+        })
+        rows.append(round_dict(row, 3))
     return rows
-
-
-# ============================================================
-# LOGISTIC REGRESSION, BOOTSTRAP, McNEMAR
-# ============================================================
-
-def fit_logistic(x, y, iterations=100):
-    """
-    Fit p(detected) = 1 / (1 + exp(-(b0 + b1 x))) by Newton-Raphson.
-    Returns (b0, b1) or None when the fit is not possible (all outcomes
-    the same, no spread in x, or perfect separation).
-    """
-    import numpy as np
-
-    x = np.asarray(x, dtype=float)
-    y = np.asarray(y, dtype=float)
-    n = len(x)
-    if n < 3 or len(np.unique(y)) < 2 or len(np.unique(x)) < 2:
-        return None
-
-    mean, sd = x.mean(), x.std() or 1.0
-    z = (x - mean) / sd                     # standardise for stability
-    a0 = a1 = 0.0
-
-    for _ in range(iterations):
-        p = 1 / (1 + np.exp(-np.clip(a0 + a1 * z, -35, 35)))
-        weight = p * (1 - p)
-        g0, g1 = (y - p).sum(), ((y - p) * z).sum()
-        h00, h01, h11 = weight.sum(), (weight * z).sum(), (weight * z * z).sum()
-        det = h00 * h11 - h01 * h01
-        if det <= 1e-12:
-            return None
-        step0 = (h11 * g0 - h01 * g1) / det
-        step1 = (h00 * g1 - h01 * g0) / det
-        a0 += step0
-        a1 += step1
-        if abs(a1) > 50:                    # perfect separation
-            return None
-        if abs(step0) < 1e-10 and abs(step1) < 1e-10:
-            break
-
-    return float(a0 - a1 * mean / sd), float(a1 / sd)
-
-
-def breaking_values(coefficients):
-    """x50 = -b0/b1, x90 = (ln 9 - b0)/b1 (thesis Chapter III)."""
-    if coefficients is None or abs(coefficients[1]) < 1e-12:
-        return None, None
-    b0, b1 = coefficients
-    return -b0 / b1, (math.log(9) - b0) / b1
-
-
-MAX_LEVELS_FOR_INTERPOLATION = 25   # interpolation only for stepped levels
-
-
-def interpolate_point(x, y, target):
-    """
-    Fallback when logistic regression is not possible (complete separation):
-    the level at which the observed detection rate crosses `target`, by
-    linear interpolation between the two neighbouring tested levels.
-    Levels are ordered from the easiest condition to the hardest.
-    """
-    levels = sorted(set(x))
-    rates = [sum(yi for xi, yi in zip(x, y) if xi == level)
-             / sum(1 for xi in x if xi == level) for level in levels]
-    if rates[0] < rates[-1]:                 # easiest condition is high x
-        levels, rates = levels[::-1], rates[::-1]
-    if rates[0] < target:
-        return levels[0]                     # already below at the easiest
-    for i in range(1, len(levels)):
-        if rates[i] < target:
-            l0, l1, r0, r1 = levels[i - 1], levels[i], rates[i - 1], rates[i]
-            return l0 + (r0 - target) / (r0 - r1) * (l1 - l0)
-    return None                              # never falls below target
-
-
-WRONG_DIRECTION = "wrong direction"
-
-
-def x50_x90(x, y, harder="higher"):
-    """
-    (x50, x90, method): logistic regression, else interpolation.
-    harder: "higher" when a larger x is a harder condition (metres, blur,
-    gamma...), "lower" when a smaller x is harder (sticker pixel width).
-    If detection does NOT fall as the condition gets harder, there is no
-    breaking point: (None, None, WRONG_DIRECTION).
-    """
-    coefficients = fit_logistic(x, y)
-    if coefficients is not None:
-        slope = coefficients[1]
-        if (harder == "higher" and slope >= 0) or (harder == "lower"
-                                                   and slope <= 0):
-            return None, None, WRONG_DIRECTION
-        x50, x90 = breaking_values(coefficients)
-        return x50, x90, "logistic regression"
-    if (y and 0 < sum(y) < len(y)
-            and 2 <= len(set(x)) <= MAX_LEVELS_FOR_INTERPOLATION):
-        return (interpolate_point(x, y, 0.5), interpolate_point(x, y, 0.9),
-                "linear interpolation (complete separation)")
-    return None, None, ""
-
-
-def describe_fit(x, y, label, harder="higher"):
-    coefficients = fit_logistic(x, y)
-    x50, x90, method = x50_x90(x, y, harder)
-    rate = sum(y) / len(y) if y else None
-
-    note = ""
-    if method == WRONG_DIRECTION:
-        method = ""
-        note = ("not estimable: detection did not fall as the condition got "
-                "harder (check the sample size per level)")
-    elif not method:
-        if y and all(y):
-            note = "detected every time: limit not reached in tested range"
-        elif y and not any(y):
-            note = "never detected in tested range"
-        else:
-            note = "not estimable (too little variation or separation)"
-    else:
-        low, high = min(x), max(x)
-        outside = [name for name, v in (("x50", x50), ("x90", x90))
-                   if v is not None and not low <= v <= high]
-        missing = [name for name, v in (("x50", x50), ("x90", x90))
-                   if v is None]
-        parts = []
-        if outside:
-            parts.append(f"{' and '.join(outside)} outside the tested range "
-                         f"({low:g}-{high:g} {label}); extrapolated")
-        if missing:
-            parts.append(f"{' and '.join(missing)} not reached in tested "
-                         "range")
-        note = "; ".join(parts)
-
-    return {"b0": coefficients[0] if coefficients else None,
-            "b1": coefficients[1] if coefficients else None,
-            "x50": x50, "x90": x90, "method": method,
-            "detection_rate": rate, "stickers": len(y), "note": note}
-
-
-def paired_bootstrap_x50(outcomes, models, x_key, resamples, seed,
-                         harder="higher"):
-    """
-    Resample IMAGES with replacement (both models keep the same images) and
-    refit each model; returns the 95% percentile CI of x50(A) - x50(B).
-    """
-    first, second = models
-    by_image = {}
-    for row in outcomes:
-        by_image.setdefault(row["image"], []).append(row)
-    images = list(by_image)
-    rng = random.Random(seed)
-    differences = []
-
-    for _ in range(resamples):
-        sample = [r for _ in images for r in by_image[rng.choice(images)]]
-        x = [r[x_key] for r in sample]
-        a = x50_x90(x, [r[f"{first}_detected"] for r in sample], harder)[0]
-        b = x50_x90(x, [r[f"{second}_detected"] for r in sample], harder)[0]
-        if a is not None and b is not None:
-            differences.append(a - b)
-
-    if len(differences) < resamples * 0.5:
-        return {"valid_resamples": len(differences), "ci_low": None,
-                "ci_high": None, "verdict": "not estimable (too many "
-                "resamples without a valid fit)"}
-
-    low = ev.percentile(differences, 2.5)
-    high = ev.percentile(differences, 97.5)
-    verdict = ("inconclusive (interval includes zero)"
-               if low <= 0 <= high else "difference is clear")
-    return {"valid_resamples": len(differences), "ci_low": low,
-            "ci_high": high, "verdict": verdict}
-
-
-def mcnemar_exact(outcomes, first, second):
-    """Exact two-sided McNemar test on paired per-sticker outcomes."""
-    only_first = sum(1 for r in outcomes if r[f"{first}_detected"]
-                     and not r[f"{second}_detected"])
-    only_second = sum(1 for r in outcomes if r[f"{second}_detected"]
-                      and not r[f"{first}_detected"])
-    n = only_first + only_second
-
-    if n == 0:
-        p_value = 1.0
-    else:
-        k = min(only_first, only_second)
-        tail = sum(math.comb(n, i) for i in range(k + 1)) / 2 ** n
-        p_value = min(1.0, 2 * tail)
-
-    return {"only_" + first: only_first, "only_" + second: only_second,
-            "p_value": p_value}
-
-
-# ============================================================
-# CHART
-# ============================================================
-
-def draw_distance_chart(outcomes, fits_m, models):
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    colours = {"YOLO26n": "#2a6fb0", "YOLO11n": "#d9822b"}
-    distances = sorted({float(r["distance_m"]) for r in outcomes
-                        if r["distance_m"]})
-    if not distances:
-        return None
-
-    figure, axis = plt.subplots(figsize=(7, 4.2))
-    for name in models:
-        rates = []
-        for d in distances:
-            group = [r[f"{name}_detected"] for r in outcomes
-                     if r["distance_m"] and float(r["distance_m"]) == d]
-            rates.append(sum(group) / len(group) if group else math.nan)
-        axis.plot(distances, rates, "o", color=colours.get(name),
-                  label=f"{name} observed")
-
-        fit = fits_m.get(name)
-        if fit and fit["b0"] is not None:
-            xs = [distances[0] + i * (distances[-1] - distances[0]) / 100
-                  for i in range(101)]
-            ys = [1 / (1 + math.exp(-(fit["b0"] + fit["b1"] * x)))
-                  for x in xs]
-            axis.plot(xs, ys, "-", color=colours.get(name),
-                      label=f"{name} logistic fit")
-
-    axis.axhline(0.5, color="grey", linestyle="--", linewidth=1,
-                 label="breaking point (50%)")
-    axis.axhline(0.9, color="grey", linestyle=":", linewidth=1,
-                 label="reliable detection (90%)")
-    axis.set_ylim(0, 1.05)
-    axis.set_xlabel("distance (m)")
-    axis.set_ylabel(f"detection rate (conf >= {DETECT_CONF}, "
-                    f"IoU >= {DETECT_IOU})")
-    axis.set_title("Field test: detection rate by distance")
-    axis.grid(alpha=0.3)
-    axis.legend(fontsize=8)
-    figure.tight_layout()
-    path = RESULTS_DIR / "chart_distance.png"
-    figure.savefig(path, dpi=200)
-    plt.close(figure)
-    return path
 
 
 # ============================================================
 # MAIN
 # ============================================================
 
-def blank_none(row):
-    return {k: (round(v, 5) if isinstance(v, float) else
-                ("" if v is None else v)) for k, v in row.items()}
-
-
-def fmt(value, digits=3):
-    return "—" if value is None else f"{value:.{digits}f}"
+def print_table(title, rows, columns):
+    print(f"\n{title}")
+    widths = [max(len(c), *(len(str(r.get(c, ""))) for r in rows)) for c in columns]
+    print("  ".join(c.ljust(w) for c, w in zip(columns, widths)))
+    for row in rows:
+        print("  ".join(str(row.get(c, "")).ljust(w) for c, w in zip(columns, widths)))
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Chapter 5 field evaluation")
-    parser.add_argument("--data", default=FIELD_DATA)
-    parser.add_argument("--log", default=str(FIELD_LOG))
-    parser.add_argument("--allow-other-gpu", action="store_true")
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[1])
+    parser.add_argument("--data", default=DATA,
+                        help="Platform address or local data.yaml")
+    parser.add_argument("--models", nargs="+", default=list(MODEL_PATHS))
+    parser.add_argument("--devices", nargs="+", default=["gpu", "cpu"],
+                        choices=["gpu", "cpu"])
+    parser.add_argument("--skip-speed", action="store_true")
+    parser.add_argument("--allow-count-mismatch", action="store_true")
+    parser.add_argument("--allow-other-gpu", action="store_true",
+                        help=f"run even if the GPU is not the "
+                             f"{EXPECTED_TEST_GPU}")
     args = parser.parse_args(argv)
 
     import torch
-    from ultralytics import YOLO
 
-    tested_gpu = ev.check_test_gpu(args.allow_other_gpu,
-                                   expected=ev.EXPECTED_FIELD_GPU)
-    model_names = list(ev.MODEL_PATHS)
+    # ---- models to evaluate -----------------------------------------
+    jobs = []
+    for name in args.models:
+        if name not in MODEL_PATHS:
+            raise SystemExit(f"Unknown model {name}. Choose from {list(MODEL_PATHS)}")
+        jobs.append((name, MODEL_PATHS[name], HEADS[name]))
 
-    rows = read_field_log(args.log)
-    print(f"Field log: {len(rows)} captures")
-    names, images = dataset_images(args.data)
-    print(f"Labelled images found: {len(images)}")
-    matched, problems = match_images(rows, images, Path(args.log).parent)
-    print(f"Matched images: {len(matched)}")
-    ways = {}
-    for item in match_images.report:
-        ways[item["matched_by"]] = ways.get(item["matched_by"], 0) + 1
-    if ways:
-        print("  matched by " + ", ".join(f"{k}: {v}" for k, v in ways.items()))
+    for name, checkpoint, _ in jobs:
+        if not checkpoint.is_file():
+            raise SystemExit(f"{name}: checkpoint not found:\n  {checkpoint}")
 
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    ev.write_csv(RESULTS_DIR / "field_data_check.csv",
-                 problems or [{"problem": "none", "file": ""}])
-    ev.write_csv(RESULTS_DIR / "field_matches.csv",
-                 match_images.report or [{"log_file": "none"}])
-    if problems:
-        print(f"WARNING: {len(problems)} data problem(s). "
-              "See field_data_check.csv")
-    if not matched:
-        raise SystemExit("No field images could be matched to the log. "
-                         "Were the files renamed?")
+    # ---- dataset ----------------------------------------------------
+    print(f"Dataset: {args.data}")
+    data_yaml, test_images, names = resolve_test_images(args.data)
+    print(f"Test images found: {len(test_images)}")
 
-    for name in model_names:
-        if not ev.MODEL_PATHS[name].is_file():
-            raise SystemExit(f"{name}: checkpoint not found: "
-                             f"{ev.MODEL_PATHS[name]}")
+    if len(test_images) != EXPECTED_TEST_IMAGES and not args.allow_count_mismatch:
+        raise SystemExit(
+            f"Expected {EXPECTED_TEST_IMAGES} test images (thesis), found "
+            f"{len(test_images)}. Check the dataset, or rerun with "
+            "--allow-count-mismatch if the thesis number changed."
+        )
 
-    device = 0 if torch.cuda.is_available() else "cpu"
+    tested_gpu = check_test_gpu(args.allow_other_gpu)
+    gpu_available = torch.cuda.is_available()
+    accuracy_device = 0 if gpu_available else "cpu"
+    env = environment_info()
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
-    jsonl = RESULTS_DIR / "field_evaluation.jsonl"
-    ev.append_jsonl(jsonl, {
-        "record_type": "field_evaluation_started", "run_id": run_id,
-        "data": str(args.data), "captures": len(rows),
-        "matched_images": len(matched), "problems": len(problems),
-        "tested_gpu": tested_gpu, "environment": ev.environment_info(),
-        "settings": {"detect_conf": DETECT_CONF, "detect_iou": DETECT_IOU,
-                     "map_conf": ev.MAP_CONF, "nms_iou": ev.NMS_IOU,
-                     "imgsz": ev.IMAGE_SIZE,
-                     "bootstrap_resamples": BOOTSTRAP_RESAMPLES},
+    jsonl = OUTPUT_DIR / "test_evaluation.jsonl"
+
+    checksums = {}
+    for name, checkpoint, _ in jobs:
+        checksums[name] = sha256_file(checkpoint)
+
+    append_jsonl(jsonl, {
+        "record_type": "evaluation_started", "run_id": run_id,
+        "timestamp": timestamp_now(), "data": str(args.data),
+        "data_yaml": str(data_yaml), "test_images": len(test_images),
+        "dataset_names": names, "environment": env,
+        "settings": {"imgsz": IMAGE_SIZE, "batch": BATCH, "map_conf": MAP_CONF,
+                     "app_conf": APP_CONF, "nms_iou": NMS_IOU,
+                     "speed_warmup": "1 full untimed pass per model",
+                     "speed_rounds": SPEED_ROUNDS,
+                     "expected_test_gpu": EXPECTED_TEST_GPU,
+                     "tested_gpu": tested_gpu},
     })
 
-    # ---- 1. standard metrics per group -------------------------------
-    metric_rows = []
-    with tempfile.TemporaryDirectory() as temp:
-        for factor, level, items in build_groups(matched):
-            group = f"{factor}_{level}".replace(" ", "_")
-            boxes = sum(count for _, _, count in items)
-            data_yaml = write_group_yaml(
-                Path(temp), group, [image for _, image, _ in items], names)
+    # ---- accuracy ---------------------------------------------------
+    accuracy_rows = []
+    for name, checkpoint, head in jobs:
+        print(f"\n=== Accuracy: {name} [{head['label']}] ===")
+        row = evaluate_accuracy(name, checkpoint, head, data_yaml, accuracy_device,
+                                test_images)
+        row.update({"test_images": len(test_images),
+                    "checkpoint_path": str(checkpoint),
+                    "checkpoint_sha256": checksums[name],
+                    "run_id": run_id})
+        accuracy_rows.append(row)
+        append_jsonl(jsonl, {"record_type": "accuracy", **row})
 
-            for name in model_names:
-                print(f"--- metrics: {name}, {factor} = {level} "
-                      f"({len(items)} images, {boxes} stickers)")
-                result = evaluate_group(ev.MODEL_PATHS[name], ev.HEADS[name],
-                                        data_yaml, device, f"{group}/{name}",
-                                        boxes)
-                row = {"group": factor, "level": level, "model": name,
-                       "inference_head": ev.HEADS[name]["label"],
-                       "images": len(items), "labelled_stickers": boxes,
-                       "small_group": len(items) < MIN_GROUP_IMAGES,
-                       **result, "run_id": run_id}
-                metric_rows.append(row)
-                ev.append_jsonl(jsonl, {"record_type": "field_group", **row})
+    write_csv(OUTPUT_DIR / "test_metrics.csv", accuracy_rows)
 
-    ev.write_csv(RESULTS_DIR / "field_metrics.csv",
-                 [blank_none(r) for r in metric_rows])
+    # ---- speed ------------------------------------------------------
+    speed_rows = []
+    if not args.skip_speed:
+        devices = []
+        for label in args.devices:
+            if label == "gpu" and not gpu_available:
+                print("No CUDA GPU found — skipping GPU speed.")
+                continue
+            devices.append((0, f"GPU ({env['gpu']})") if label == "gpu"
+                           else ("cpu", f"CPU ({env['cpu']}, "
+                                        f"{env['cpu_threads']} threads)"))
 
-    # ---- 2. per-sticker outcomes --------------------------------------
-    print("\n--- per-sticker outcomes (conf >= 0.25, IoU >= 0.5)")
-    models = {name: (YOLO(str(ev.MODEL_PATHS[name])), ev.HEADS[name])
-              for name in model_names}
-    outcomes = sticker_outcomes(models, matched, device)
-    ev.write_csv(RESULTS_DIR / "field_outcomes.csv",
-                 [blank_none(r) for r in outcomes] or [{"image": "none"}])
-    if not outcomes:
-        raise SystemExit("No labelled stickers found in the field images.")
+        print(f"\nLoading {len(test_images)} test images into memory...")
+        images = load_images(test_images)
 
-    # ---- 3. breaking points (SOP 4) -----------------------------------
-    # Thesis: the vehicle is stationary at each marker so that distance is
-    # the only condition that changes. Captures marked as moving are kept in
-    # the metrics above but left out of the distance breaking points.
-    parked = [r for r in outcomes if r.get("motion", "parked") in
-              ("", DISTANCE_MOTION)]
-    if not parked:
-        raise SystemExit("No parked captures with stickers: the distance "
-                         "breaking points need captures marked 'parked'.")
-    width = [r["sticker_px_width_640"] for r in parked]
-    with_distance = [r for r in parked if r["distance_m"]]
-    metres = [float(r["distance_m"]) for r in with_distance]
+        for device, device_label in devices:
+            print(f"=== Speed on {device_label} ===")
+            for row in benchmark_device(jobs, images, device, device_label):
+                row["run_id"] = run_id
+                speed_rows.append(row)
+                append_jsonl(jsonl, {"record_type": "speed", **row})
 
-    points, fits_m = [], {}
-    for name in model_names:
-        by_width = describe_fit(width, [r[f"{name}_detected"]
-                                        for r in parked], "px",
-                                harder="lower")
-        by_metre = describe_fit(metres, [r[f"{name}_detected"]
-                                         for r in with_distance], "m")
-        fits_m[name] = by_metre
-        point = {
-            "model": name, "stickers": by_width["stickers"],
-            "detection_rate": by_width["detection_rate"],
-            "x50_px_width": by_width["x50"], "x90_px_width": by_width["x90"],
-            "note_px": by_width["note"],
-            "method_px": by_width["method"],
-            "x50_metres": by_metre["x50"], "x90_metres": by_metre["x90"],
-            "note_metres": by_metre["note"],
-            "method_metres": by_metre["method"],
-            "b0_px": by_width["b0"], "b1_px": by_width["b1"],
-            "b0_m": by_metre["b0"], "b1_m": by_metre["b1"],
-        }
-        points.append(point)
-        ev.append_jsonl(jsonl, {"record_type": "breaking_point", **point})
+        write_csv(OUTPUT_DIR / "test_speed.csv", speed_rows)
 
-    ev.write_csv(RESULTS_DIR / "field_breaking_points.csv",
-                 [blank_none(p) for p in points])
+    # ---- summary ----------------------------------------------------
+    print_table(
+        f"TEST SET ACCURACY ({len(test_images)} images)",
+        accuracy_rows,
+        ["model", "precision", "recall", "f1", "map50", "map50_95",
+         "labelled_stickers", "tp_at_app_conf", "fp_at_app_conf", "fn_at_app_conf",
+         "mean_conf_detected", "mean_conf_all_stickers"],
+    )
+    if speed_rows:
+        print_table(
+            "SPEED (batch 1, after warm-up; ms per image)",
+            speed_rows,
+            ["model", "device", "preprocess_ms_mean", "inference_ms_mean",
+             "postprocess_ms_mean", "total_ms_mean", "fps_runs_mean",
+             "fps_runs_sd", "model_only_fps_runs_mean",
+             "round_total_ms_means"],
+        )
 
-    # ---- 4. model comparison ------------------------------------------
-    first, second = model_names[0], model_names[1]
-    print(f"--- paired bootstrap ({BOOTSTRAP_RESAMPLES} resamples)")
-    boot_px = paired_bootstrap_x50(parked, (first, second),
-                                   "sticker_px_width_640",
-                                   BOOTSTRAP_RESAMPLES, BOOTSTRAP_SEED,
-                                   harder="lower")
-    test = mcnemar_exact(parked, first, second)
-    comparison = {
-        "comparison": f"{first} - {second}",
-        "x50_px_difference": (
-            points[0]["x50_px_width"] - points[1]["x50_px_width"]
-            if points[0]["x50_px_width"] is not None
-            and points[1]["x50_px_width"] is not None else None),
-        "x50_px_diff_ci_low": boot_px["ci_low"],
-        "x50_px_diff_ci_high": boot_px["ci_high"],
-        "bootstrap_valid_resamples": boot_px["valid_resamples"],
-        "bootstrap_verdict": boot_px["verdict"],
-        "stickers": len(parked),
-        f"detected_only_by_{first}": test["only_" + first],
-        f"detected_only_by_{second}": test["only_" + second],
-        "mcnemar_exact_p": test["p_value"],
-        "note": ("A smaller x50 pixel width means the model still detects "
-                 "smaller (farther) stickers, i.e. it tolerates distance "
-                 "better."),
-    }
-    ev.write_csv(RESULTS_DIR / "field_comparison.csv",
-                 [blank_none(comparison)])
-    ev.append_jsonl(jsonl, {"record_type": "comparison", **comparison})
-
-    chart = draw_distance_chart(parked, fits_m, model_names)
-
-    # ---- printed summary ----------------------------------------------
-    print(f"\nFIELD METRICS (* = fewer than {MIN_GROUP_IMAGES} images)")
-    print(f"{'group':<11}{'level':<14}{'model':<9}{'imgs':>5}{'stk':>5}"
-          f"{'P@.25':>8}{'R@.25':>8}{'mAP50':>8}{'mAP50-95':>10}")
-    for r in metric_rows:
-        flag = "*" if r["small_group"] else " "
-        print(f"{r['group']:<11}{r['level'] + flag:<14}{r['model']:<9}"
-              f"{r['images']:>5}{r['labelled_stickers']:>5}"
-              f"{fmt(r['precision_at_app_conf']):>8}"
-              f"{fmt(r['recall_at_app_conf']):>8}{fmt(r['map50']):>8}"
-              f"{fmt(r['map50_95']):>10}")
-
-    print("\nDISTANCE BREAKING POINTS (logistic regression)")
-    for p in points:
-        print(f"{p['model']:<9} x50 = {fmt(p['x50_px_width'], 1)} px "
-              f"({fmt(p['x50_metres'], 2)} m)   x90 = "
-              f"{fmt(p['x90_px_width'], 1)} px "
-              f"({fmt(p['x90_metres'], 2)} m)")
-        for label, note in (("pixel width", p["note_px"]),
-                            ("metres", p["note_metres"])):
-            if note:
-                print(f"          note ({label}): {note}")
-
-    print(f"\nCOMPARISON {first} vs {second}")
-    print(f"x50 difference: {fmt(comparison['x50_px_difference'], 2)} px, "
-          f"95% CI [{fmt(boot_px['ci_low'], 2)}, "
-          f"{fmt(boot_px['ci_high'], 2)}] -> {boot_px['verdict']}")
-    print(f"McNemar: only {first} detected {test['only_' + first]}, only "
-          f"{second} detected {test['only_' + second]}, "
-          f"exact p = {test['p_value']:.4f}")
-
-    print(f"\nSaved in {RESULTS_DIR}")
-    if chart:
-        print(f"Chart: {chart.name}")
-    return metric_rows, outcomes, points, comparison
+    print(f"\nSaved: {OUTPUT_DIR / 'test_metrics.csv'}")
+    if speed_rows:
+        print(f"Saved: {OUTPUT_DIR / 'test_speed.csv'}")
+    print(f"Saved: {jsonl}")
+    print(f"Plots: {EVAL_RUNS_DIR}")
+    return accuracy_rows, speed_rows
 
 
 if __name__ == "__main__":

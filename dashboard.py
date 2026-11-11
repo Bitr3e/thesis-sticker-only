@@ -1087,6 +1087,12 @@ class Dashboard:
             better = (higher_better(x, y) if key == "tp_at_app_conf" else
                       higher_better(-x, -y))
             rows.append((label, f"{x:.0f}", f"{y:.0f}", better))
+        for key, label in (("mean_conf_detected", "Mean confidence (found stickers)"),
+                           ("mean_conf_all_stickers", "Mean confidence (all stickers, missed = 0)")):
+            x, y = num(m["YOLO26n"].get(key)), num(m["YOLO11n"].get(key))
+            if x is None or y is None:
+                continue
+            rows.append((label, f"{x:.3f}", f"{y:.3f}", higher_better(x, y)))
         self.table(("Measure", "YOLO26n", "YOLO11n", "Better"), rows,
                    widths=[260, 160, 160, 260], winner_column=3)
 
@@ -1178,6 +1184,41 @@ class Dashboard:
             self.text("Photos per distance (parked): " + ", ".join(
                 f"{d:g} m: {n}" for d, n in field["counts"].items()) + ".",
                 muted=True)
+
+        # Accuracy at each distance (the same measures as Test 1), so both
+        # models have numbers even when a breaking point is not estimable.
+        by_level = {}
+        for r in field["metrics"]:
+            if r.get("group") == "distance_m":
+                by_level.setdefault(r.get("level"), {})[r.get("model")] = r
+        rows = []
+        for level in sorted(by_level, key=lambda v: num(v) or 0):
+            pair = by_level[level]
+            if len(pair) < 2:
+                continue
+
+            def value(model, key):
+                v = num(pair[model].get(key))
+                return "—" if v is None else f"{v:.2f}"
+            stickers = pair[MODELS[0]].get("labelled_stickers", "")
+            rows.append((f"{level} m", stickers,
+                         value(MODELS[0], "recall_at_app_conf"),
+                         value(MODELS[1], "recall_at_app_conf"),
+                         value(MODELS[0], "precision_at_app_conf"),
+                         value(MODELS[1], "precision_at_app_conf"),
+                         value(MODELS[0], "map50"),
+                         value(MODELS[1], "map50")))
+        if rows:
+            self.section("Accuracy at each distance")
+            self.table(("Distance", "Stickers", "YOLO26n recall",
+                        "YOLO11n recall", "YOLO26n precision",
+                        "YOLO11n precision", "YOLO26n mAP50",
+                        "YOLO11n mAP50"), rows,
+                       widths=[76, 76, 112, 112, 142, 142, 122, 122])
+            self.text("Recall = share of the real stickers that were found; "
+                      "precision = share of the boxes that were real stickers "
+                      "(both at confidence 0.25). Distances with fewer than "
+                      "10 stickers give rough numbers.", muted=True)
 
     def page_synthetic(self):
         synthetic = load_synthetic()
