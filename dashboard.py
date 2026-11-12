@@ -136,8 +136,8 @@ SCRIPTS = {
 
 # The computer each test is measured on, as stated in the thesis.
 EXPECTED_GPU = {
-    "test": "GTX 1660 SUPER",
-    "synthetic": "GTX 1660 SUPER",
+    "test": "RTX 2050",
+    "synthetic": "RTX 2050",
     "field": "RTX 2050",
 }
 TEST_NAMES = {"test": "Test 1", "synthetic": "Test 3", "field": "Test 2"}
@@ -1045,7 +1045,7 @@ class Dashboard:
             "CPU, after a full warm-up pass.",
         ])
         buttons = [("Run Test 1", "test", [])]
-        note = "about 10-20 minutes (GTX 1660 SUPER desktop)"
+        note = "about 10-20 minutes (RTX 2050 laptop)"
         if len(test1["metrics"]) < 2:
             self.no_results("Click Run Test 1 to create the results.")
             self.actions(buttons, note)
@@ -1135,9 +1135,7 @@ class Dashboard:
         if len(field["points"]) < 2:
             self.no_results("The field test has not been evaluated yet. After "
                             "the field photos are captured and labelled, click "
-                            "Run Test 2 on the laptop. To show the results on "
-                            "this computer, copy the laptop's "
-                            "research_outputs/field_results folder here.")
+                            "Run Test 2 on this laptop.")
             self.actions(buttons, note)
             return
         self.run_later(buttons, note)
@@ -1241,7 +1239,7 @@ class Dashboard:
         buttons = [("Run Test 3", "synthetic", []),
                    ("Quick trial (5 photos)", "synthetic",
                     ["--max-images", "5"])]
-        note = "full run about 45-60 minutes (GTX 1660 SUPER desktop)"
+        note = "full run about 45-60 minutes (RTX 2050 laptop)"
         if not synthetic["points"]:
             self.no_results("Click Run Test 3 to create the results.")
             self.actions(buttons, note)

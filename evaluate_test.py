@@ -10,13 +10,15 @@ This produces the main result table for the thesis (SOP 2 and SOP 3):
        - one full untimed warm-up pass per model first
        - three timed runs per model, swapping the model order each run
        - FPS as mean and SD of the three runs, end to end and model only
-  The script checks that it runs on the GTX 1660 SUPER desktop.
        - preprocess / inference / postprocess time per image
        - mean, standard deviation, median and 95th percentile
        - FPS, on the GPU and on the CPU
 
 Both models are evaluated the same way. YOLO26n uses its NMS-free one-to-one
 head (nms=False), exactly as in app.py. YOLO11n uses standard NMS.
+
+The script checks that it runs on the RTX 2050 laptop, the machine named in
+the thesis (see EXPECTED_GPU).
 
 Usage (from the project folder, with the venv active):
     python evaluate_test.py                  # accuracy + GPU and CPU speed
@@ -203,16 +205,15 @@ def environment_info():
     }
 
 
-# Thesis Limitation section: the natural test set, the synthetic stressor
-# test and the FPS benchmark run on the GTX 1660 SUPER desktop; only the
-# field test runs on the RTX 2050 laptop. Each script stops if it finds a
-# different GPU, so results from the wrong machine cannot end up in the
-# tables by mistake.
-EXPECTED_TEST_GPU = "GTX 1660 SUPER"
-EXPECTED_FIELD_GPU = "RTX 2050"
+# Thesis Environment / Limitations section: all three tests (the natural test
+# set, the FPS benchmark, the synthetic stressors and the field test) are
+# measured on the RTX 2050 laptop. Each script stops if it finds a different
+# GPU, so results from the wrong machine cannot end up in the tables by
+# mistake.
+EXPECTED_GPU = "RTX 2050"
 
 
-def check_test_gpu(allow_other, expected=EXPECTED_TEST_GPU):
+def check_test_gpu(allow_other, expected=EXPECTED_GPU):
     """Stop unless the GPU is the one the thesis names (or the user overrides)."""
     import torch
 
@@ -539,7 +540,7 @@ def main(argv=None):
     parser.add_argument("--allow-count-mismatch", action="store_true")
     parser.add_argument("--allow-other-gpu", action="store_true",
                         help=f"run even if the GPU is not the "
-                             f"{EXPECTED_TEST_GPU}")
+                             f"{EXPECTED_GPU}")
     args = parser.parse_args(argv)
 
     import torch
@@ -587,7 +588,7 @@ def main(argv=None):
                      "app_conf": APP_CONF, "nms_iou": NMS_IOU,
                      "speed_warmup": "1 full untimed pass per model",
                      "speed_rounds": SPEED_ROUNDS,
-                     "expected_test_gpu": EXPECTED_TEST_GPU,
+                     "expected_gpu": EXPECTED_GPU,
                      "tested_gpu": tested_gpu},
     })
 
