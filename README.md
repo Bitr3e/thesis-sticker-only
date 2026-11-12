@@ -6,7 +6,7 @@ of PSU student vehicle stickers and compared in three tests:
 
 | Test | What it checks | Script | Computer |
 |---|---|---|---|
-| 1 Natural test set | Accuracy (mAP, precision, recall) and speed (FPS) on 210 unseen photos | `evaluate_test.py` | RTX 2050 laptop |
+| 1 Natural test set | Accuracy (mAP, precision, recall, confidence) and speed (FPS) on 210 unseen photos | `evaluate_test.py` | RTX 2050 laptop |
 | 2 Field test | Up to what distance (6-10 m) each model still finds the sticker | `evaluate_field.py` | RTX 2050 laptop |
 | 3 Synthetic stressors | At what level of motion blur, occlusion, low light and glare each model fails | `evaluate_synthetic.py` | RTX 2050 laptop |
 

@@ -1032,15 +1032,22 @@ class Dashboard:
 
     def page_test1(self):
         test1 = load_test1()
+        rows_seen = list(test1["metrics"].values())
+        first = rows_seen[0] if rows_seen else {}
+        photos = int(num(first.get("test_images")) or 210)
+        stickers = int(num(first.get("labelled_stickers")) or 0)
+        sticker_text = f" ({stickers} stickers)" if stickers else ""
         self.heading(
             "Test 1 · Natural test set",
-            "Both models take the same final exam: 210 photos (238 stickers) "
-            "they never saw during training. Each model's boxes are compared "
-            "with the correct boxes, and the time per photo is measured.")
+            f"Both models take the same final exam: {photos} photos"
+            f"{sticker_text} they never saw during training. Each model's "
+            "boxes are compared with the correct boxes, and the time per "
+            "photo is measured.")
         self.steps_box([
-            "Load the 210 test photos and their correct sticker boxes.",
+            f"Load the {photos} test photos and their correct sticker boxes.",
             "Each model finds stickers in every photo.",
-            "Compare with the correct boxes: precision, recall, mAP.",
+            "Compare with the correct boxes: precision, recall, mAP, and how "
+            "confident the model is when it finds a sticker.",
             "Time each model photo by photo: 3 runs on the GPU and 3 on the "
             "CPU, after a full warm-up pass.",
         ])
@@ -1065,7 +1072,9 @@ class Dashboard:
                      num(gpu["YOLO11n"].get("fps_runs_sd")) or 0)
             cards.append(("Fastest on GPU", higher_better(fa, fb, tolerance=sd),
                           f"{fa:.1f} vs {fb:.1f} FPS (run-to-run ± {sd:.1f})"))
-        cards.append(("Stickers found (of 238)",
+        found_label = (f"Stickers found (of {stickers})" if stickers
+                       else "Stickers found")
+        cards.append((found_label,
                       f"{m['YOLO26n']['tp_at_app_conf']} vs "
                       f"{m['YOLO11n']['tp_at_app_conf']}",
                       "YOLO26n vs YOLO11n, at confidence 0.25"))
@@ -1087,12 +1096,19 @@ class Dashboard:
             better = (higher_better(x, y) if key == "tp_at_app_conf" else
                       higher_better(-x, -y))
             rows.append((label, f"{x:.0f}", f"{y:.0f}", better))
-        for key, label in (("mean_conf_detected", "Mean confidence (found stickers)"),
-                           ("mean_conf_all_stickers", "Mean confidence (all stickers, missed = 0)")):
+        for key, label, sd_key in (
+                ("mean_conf_detected", "Mean confidence (found stickers)",
+                 "sd_conf_detected"),
+                ("mean_conf_all_stickers",
+                 "Mean confidence (all stickers, missed = 0)",
+                 "sd_conf_all_stickers")):
             x, y = num(m["YOLO26n"].get(key)), num(m["YOLO11n"].get(key))
             if x is None or y is None:
                 continue
-            rows.append((label, f"{x:.3f}", f"{y:.3f}", higher_better(x, y)))
+            sdx = num(m["YOLO26n"].get(sd_key)) or 0.0
+            sdy = num(m["YOLO11n"].get(sd_key)) or 0.0
+            rows.append((label, f"{x:.3f} ± {sdx:.3f}",
+                         f"{y:.3f} ± {sdy:.3f}", higher_better(x, y)))
         self.table(("Measure", "YOLO26n", "YOLO11n", "Better"), rows,
                    widths=[260, 160, 160, 260], winner_column=3)
 
